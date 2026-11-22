@@ -622,7 +622,7 @@ function pickFolderNative() {
     if (process.platform === 'win32') {
       file = 'powershell.exe';
       sargs = ['-NoProfile', '-STA', '-Command',
-        "Add-Type -AssemblyName System.Windows.Forms; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Select project folder'; $d.ShowNewFolderButton = $true; if ($d.ShowDialog() -eq 'OK') { $d.SelectedPath }"];
+        "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Application]::EnableVisualStyles(); $f = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false; Opacity = 0 }; $d = New-Object System.Windows.Forms.FolderBrowserDialog; $d.Description = 'Select project folder'; $d.ShowNewFolderButton = $true; try { if ($d.ShowDialog($f) -eq 'OK') { $d.SelectedPath } } finally { $f.Dispose(); $d.Dispose() }"];
     } else if (process.platform === 'darwin') {
       file = 'osascript';
       sargs = ['-e', 'POSIX path of (choose folder with prompt "Select project folder")'];
@@ -660,7 +660,6 @@ const PUBLIC_PATHS = new Set([
   '/.well-known/oauth-authorization-server',
   '/.well-known/openid-configuration',
   '/.well-known/oauth-protected-resource',
-  '/oauth/register',
   '/oauth/authorize',
   '/oauth/token'
 ]);
@@ -1720,22 +1719,34 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === '/oauth/authorize') {
-      const redirectUri = url.searchParams.get('redirect_uri');
-      const state = url.searchParams.get('state') || '';
-      const clientId = url.searchParams.get('client_id') || '';
+      const params = req.method === 'POST' ? new URLSearchParams(await readBody(req, 65536)) : url.searchParams;
+      const redirectUri = params.get('redirect_uri');
+      const state = params.get('state') || '';
+      const clientId = params.get('client_id') || '';
+      const responseType = params.get('response_type') || '';
+      const challenge = params.get('code_challenge') || '';
+      const method = params.get('code_challenge_method') || 'S256';
       const client = oauthClients.get(clientId);
       if (redirectUri) {
         if (!client) return sendJson(res, 400, { error: 'invalid_client', error_description: 'Unknown client_id — register first' });
-        if (url.searchParams.get('response_type') !== 'code') return sendJson(res, 400, { error: 'unsupported_response_type' });
-        const challenge = url.searchParams.get('code_challenge') || '';
+        if (responseType !== 'code') return sendJson(res, 400, { error: 'unsupported_response_type' });
         if (!challenge && client.authMethod === 'none') return sendJson(res, 400, { error: 'invalid_request', error_description: 'code_challenge (PKCE) is required for public clients' });
         const uriOk = client.redirect_uris.length ? client.redirect_uris.includes(redirectUri) : validRedirectUri(redirectUri);
         if (!uriOk) return sendJson(res, 400, { error: 'invalid_redirect_uri' });
+        const escHtml = (s) => String(s || '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+        const renderForm = (errMsg = '') => {
+          const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Authorize Easy MCP</title><style>body{font-family:system-ui,sans-serif;background:#111;color:#eee;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}form{background:#1b1917;border:1px solid #333;border-radius:12px;padding:24px;max-width:400px;width:90%}h2{margin:0 0 8px;font-size:18px}p{color:#aaa;font-size:13px;line-height:1.4}input[type=password]{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;border:1px solid #444;background:#0d0c0a;color:#fff;margin:12px 0}button{width:100%;padding:10px;border:0;border-radius:8px;background:#ea580c;color:#fff;font-weight:600;cursor:pointer}.err{color:#ef4444;font-size:13px;margin-bottom:8px}</style></head><body><form method="POST" action="/oauth/authorize"><h2>Authorize Easy MCP</h2><p>Enter your Easy MCP master token to approve access for client <code>${escHtml(clientId)}</code>.</p>${errMsg ? `<div class="err">${escHtml(errMsg)}</div>` : ''}<input type="hidden" name="client_id" value="${escHtml(clientId)}"><input type="hidden" name="redirect_uri" value="${escHtml(redirectUri)}"><input type="hidden" name="response_type" value="${escHtml(responseType)}"><input type="hidden" name="state" value="${escHtml(state)}"><input type="hidden" name="code_challenge" value="${escHtml(challenge)}"><input type="hidden" name="code_challenge_method" value="${escHtml(method)}"><input type="password" name="token" placeholder="Easy MCP master token" required autofocus><button type="submit">Approve &amp; Connect</button></form></body></html>`;
+          res.writeHead(errMsg ? 401 : 200, { 'Content-Type': 'text/html; charset=utf-8' });
+          return res.end(html);
+        };
+        if (req.method !== 'POST') return renderForm();
+        const givenToken = params.get('token') || '';
+        if (!safeEqual(givenToken, TOKEN)) return renderForm('Invalid Easy MCP token.');
         const code = crypto.randomBytes(32).toString('hex');
         oauthCodes.set(code, {
           exp: Date.now() + 600000,
           challenge,
-          method: url.searchParams.get('code_challenge_method') || 'S256',
+          method,
           clientId,
           redirectUri
         });
